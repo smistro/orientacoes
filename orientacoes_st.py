@@ -8,6 +8,7 @@ from google.oauth2.service_account import Credentials
 # =========================================================
 # SISTEMA COLABORATIVO DE CONTROLE DE ORIENTAÇÕES
 # Streamlit + Google Sheets
+# Versão com autenticação interna por e-mail e senha
 # =========================================================
 
 st.set_page_config(
@@ -29,11 +30,15 @@ ABA_CADASTRO = "cadastro"
 ABA_REGISTROS = "registros"
 ABA_CONFIG = "configuracoes"
 
+# A aba cadastro precisa ter exatamente estas colunas na primeira linha:
+# Discente | Programa | Nível | Email | Senha | Perfil | Ativo
 COLUNAS_CADASTRO = [
     "Discente",
     "Programa",
     "Nível",
     "Email",
+    "Senha",
+    "Perfil",
     "Ativo"
 ]
 
@@ -52,6 +57,8 @@ COLUNAS_REGISTROS = [
     "Observações",
     "Atualizado_por"
 ]
+
+PERFIS = ["Orientando", "Orientador"]
 
 SITUACOES_PADRAO = [
     "Projeto de pesquisa",
@@ -155,6 +162,38 @@ def obter_aba(planilha, nome_aba, colunas):
     return aba
 
 
+def ler_aba_com_cabecalho_padrao(aba, colunas):
+    """
+    Lê uma aba do Google Sheets usando o cabeçalho definido no código.
+    Isso evita erro do gspread quando há cabeçalhos duplicados, vazios
+    ou diferentes na primeira linha da planilha.
+    """
+    valores = aba.get_all_values()
+
+    if not valores:
+        aba.update([colunas])
+        return pd.DataFrame(columns=colunas)
+
+    primeira_linha = [str(x).strip() for x in valores[0]]
+
+    if primeira_linha[:len(colunas)] != colunas:
+        aba.update("A1", [colunas])
+        valores = aba.get_all_values()
+
+    dados = valores[1:]
+
+    if not dados:
+        return pd.DataFrame(columns=colunas)
+
+    dados_ajustados = []
+    for linha in dados:
+        linha = linha[:len(colunas)]
+        linha = linha + [""] * (len(colunas) - len(linha))
+        dados_ajustados.append(linha)
+
+    return pd.DataFrame(dados_ajustados, columns=colunas)
+
+
 @st.cache_data(ttl=20)
 def carregar_dados():
     """Carrega cadastro, registros e configurações da Planilha Google."""
@@ -164,28 +203,12 @@ def carregar_dados():
     aba_registros = obter_aba(planilha, ABA_REGISTROS, COLUNAS_REGISTROS)
     aba_config = obter_aba(planilha, ABA_CONFIG, ["Tipo", "Valor"])
 
-    cadastro = pd.DataFrame(aba_cadastro.get_all_records())
-    registros = pd.DataFrame(aba_registros.get_all_records())
-    config = pd.DataFrame(aba_config.get_all_records())
-
-    for col in COLUNAS_CADASTRO:
-        if col not in cadastro.columns:
-            cadastro[col] = ""
-
-    for col in COLUNAS_REGISTROS:
-        if col not in registros.columns:
-            registros[col] = ""
-
-    if cadastro.empty:
-        cadastro = pd.DataFrame(columns=COLUNAS_CADASTRO)
-
-    if registros.empty:
-        registros = pd.DataFrame(columns=COLUNAS_REGISTROS)
-
-    cadastro = cadastro[COLUNAS_CADASTRO].copy()
-    registros = registros[COLUNAS_REGISTROS].copy()
+    cadastro = ler_aba_com_cabecalho_padrao(aba_cadastro, COLUNAS_CADASTRO)
+    registros = ler_aba_com_cabecalho_padrao(aba_registros, COLUNAS_REGISTROS)
+    config = ler_aba_com_cabecalho_padrao(aba_config, ["Tipo", "Valor"])
 
     cadastro["Ativo"] = cadastro["Ativo"].replace("", "Sim")
+    cadastro["Perfil"] = cadastro["Perfil"].replace("", "Orientando")
 
     if "Data" in registros.columns:
         registros["Data"] = pd.to_datetime(registros["Data"], errors="coerce").dt.date
@@ -226,12 +249,15 @@ def salvar_cadastro_completo(df_cadastro):
     for col in COLUNAS_CADASTRO:
         if col not in df.columns:
             df[col] = ""
+
     df = df[COLUNAS_CADASTRO].fillna("")
+
+    for col in df.columns:
+        df[col] = df[col].astype(str)
 
     aba.clear()
     aba.update([COLUNAS_CADASTRO] + df.values.tolist())
     st.cache_data.clear()
-
 
 # =========================================================
 # FUNÇÕES AUXILIARES
@@ -258,6 +284,16 @@ def calcular_status_prazo(prazo):
         return "Próximo do prazo"
 
     return "Dentro do prazo"
+
+
+def normalizar_email(email):
+    if pd.isna(email):
+        return ""
+    return str(email).strip().lower()
+
+
+def usuario_ativo(valor):
+    return str(valor).strip().lower() in ["sim", "s", "yes", "1", "true"]
 
 
 def resumo_ultima_situacao(df_registros, df_cadastro):
@@ -315,13 +351,6 @@ def resumo_ultima_situacao(df_registros, df_cadastro):
     base = base.drop(columns=["Última atualização_dt"])
     return base
 
-
-def normalizar_email(email):
-    if pd.isna(email):
-        return ""
-    return str(email).strip().lower()
-
-
 # =========================================================
 # CARREGAMENTO
 # =========================================================
@@ -330,56 +359,76 @@ df_cadastro, df_registros, SITUACOES, PENDENCIAS = carregar_dados()
 df_resumo = resumo_ultima_situacao(df_registros, df_cadastro)
 
 # =========================================================
-# LOGIN SIMPLES
+# LOGIN INTERNO POR E-MAIL E SENHA
 # =========================================================
 
 st.sidebar.title("📚 Orientações")
-
-modo_acesso = st.sidebar.radio(
-    "Tipo de acesso",
-    ["Orientando", "Orientador"],
-    help="Orientandos visualizam e atualizam apenas seu próprio acompanhamento. O orientador visualiza tudo."
-)
 
 email_usuario = st.sidebar.text_input(
     "Seu e-mail",
     placeholder="nome@email.com"
 ).strip().lower()
 
-senha_orientador = ""
-if modo_acesso == "Orientador":
-    senha_orientador = st.sidebar.text_input("Senha do orientador", type="password")
+senha_usuario = st.sidebar.text_input(
+    "Senha",
+    type="password"
+)
 
-# Senha simples do orientador, definida nos Secrets.
-# Em .streamlit/secrets.toml:
-# SENHA_ORIENTADOR = "sua_senha_aqui"
-SENHA_ORIENTADOR = st.secrets.get("SENHA_ORIENTADOR", "admin123")
-
-if not email_usuario:
+if not email_usuario or not senha_usuario:
     st.title("Controle de Orientações")
-    st.info("Informe seu e-mail na barra lateral para acessar o sistema.")
+    st.info("Informe seu e-mail e senha na barra lateral para acessar o sistema.")
     st.stop()
 
-if modo_acesso == "Orientador":
-    if senha_orientador != SENHA_ORIENTADOR:
-        st.title("Controle de Orientações")
-        st.warning("Informe a senha do orientador para acessar o painel completo.")
-        st.stop()
-    acesso_orientador = True
-else:
-    acesso_orientador = False
+if df_cadastro.empty:
+    st.title("Controle de Orientações")
+    st.error("Nenhum usuário cadastrado.")
+    st.info("Cadastre pelo menos um orientador na aba cadastro da planilha Google.")
+    st.stop()
+
+if "Senha" not in df_cadastro.columns:
+    st.title("Controle de Orientações")
+    st.error("A coluna 'Senha' não foi encontrada na aba cadastro.")
+    st.info("A primeira linha da aba cadastro deve ser: Discente | Programa | Nível | Email | Senha | Perfil | Ativo")
+    st.stop()
+
+if "Perfil" not in df_cadastro.columns:
+    st.title("Controle de Orientações")
+    st.error("A coluna 'Perfil' não foi encontrada na aba cadastro.")
+    st.info("A primeira linha da aba cadastro deve ser: Discente | Programa | Nível | Email | Senha | Perfil | Ativo")
+    st.stop()
+
+df_cadastro["Email_normalizado"] = (
+    df_cadastro["Email"]
+    .astype(str)
+    .str.strip()
+    .str.lower()
+)
+
+usuario_logado = df_cadastro[
+    (df_cadastro["Email_normalizado"] == email_usuario)
+    &
+    (df_cadastro["Senha"].astype(str).str.strip() == senha_usuario)
+]
+
+if usuario_logado.empty:
+    st.title("Controle de Orientações")
+    st.error("E-mail ou senha inválidos.")
+    st.stop()
+
+if not usuario_ativo(usuario_logado.iloc[0]["Ativo"]):
+    st.title("Controle de Orientações")
+    st.error("Usuário inativo.")
+    st.stop()
+
+nome_usuario = str(usuario_logado.iloc[0]["Discente"]).strip()
+perfil_usuario = str(usuario_logado.iloc[0]["Perfil"]).strip()
+acesso_orientador = perfil_usuario == "Orientador"
+
+st.sidebar.success(f"Logado como: {nome_usuario}")
+st.sidebar.caption(f"Perfil: {perfil_usuario}")
 
 if not acesso_orientador:
-    df_cadastro["Email_normalizado"] = df_cadastro["Email"].apply(normalizar_email)
-    orientando_logado = df_cadastro[df_cadastro["Email_normalizado"] == email_usuario]
-
-    if orientando_logado.empty:
-        st.title("Controle de Orientações")
-        st.error("E-mail não encontrado no cadastro de orientandos.")
-        st.info("Verifique se o e-mail foi cadastrado corretamente na aba cadastro da planilha Google.")
-        st.stop()
-
-    nomes_permitidos = orientando_logado[["Discente", "Programa", "Nível"]].drop_duplicates()
+    nomes_permitidos = usuario_logado[["Discente", "Programa", "Nível"]].drop_duplicates()
 
     df_resumo = df_resumo.merge(
         nomes_permitidos,
@@ -464,7 +513,7 @@ if pagina == "Painel geral":
             ]
         ].sort_values(["Status do prazo", "Dias sem atualização"], ascending=[True, False])
 
-        st.dataframe(tabela, use_container_width=True, hide_index=True)
+        st.dataframe(tabela, use_container_width=True, hide_index=True, height=600)
 
     with col_b:
         st.subheader("Distribuição por nível")
@@ -546,9 +595,13 @@ elif pagina == "Nova atualização":
     st.caption("Registre situação atual, pendências e observações.")
 
     if acesso_orientador:
-        orientandos_ativos = df_cadastro[df_cadastro["Ativo"].astype(str).str.lower().isin(["sim", "s", "yes", "1", "true"])].copy()
+        orientandos_ativos = df_cadastro[
+            df_cadastro["Ativo"].apply(usuario_ativo)
+            &
+            (df_cadastro["Perfil"].astype(str).str.strip() == "Orientando")
+        ].copy()
     else:
-        orientandos_ativos = orientando_logado.copy()
+        orientandos_ativos = usuario_logado.copy()
 
     orientandos_ativos["Nome completo"] = (
         orientandos_ativos["Discente"].astype(str)
@@ -632,14 +685,17 @@ elif pagina in ["Histórico", "Meu histórico"]:
                 df_hist = df_hist[df_hist["Situação"].isin(situacao_filtro)]
 
         df_hist = df_hist.sort_values(["Data", "Hora"], ascending=False)
-        st.dataframe(df_hist, use_container_width=True, hide_index=True)
+        st.dataframe(df_hist, use_container_width=True, hide_index=True, height=600)
 
         st.subheader("Linha do tempo")
 
         if acesso_orientador:
             nomes_timeline = sorted(df_hist["Discente"].dropna().unique())
-            discente_timeline = st.selectbox("Selecionar discente", nomes_timeline)
-            linha_tempo = df_hist[df_hist["Discente"] == discente_timeline].sort_values(["Data", "Hora"], ascending=False)
+            if nomes_timeline:
+                discente_timeline = st.selectbox("Selecionar discente", nomes_timeline)
+                linha_tempo = df_hist[df_hist["Discente"] == discente_timeline].sort_values(["Data", "Hora"], ascending=False)
+            else:
+                linha_tempo = pd.DataFrame(columns=df_hist.columns)
         else:
             linha_tempo = df_hist.sort_values(["Data", "Hora"], ascending=False)
 
@@ -662,33 +718,38 @@ elif pagina in ["Histórico", "Meu histórico"]:
 
 elif pagina == "Cadastro de orientandos":
     st.title("Cadastro de orientandos")
-    st.caption("Inclua e edite os orientandos autorizados a acessar o sistema.")
+    st.caption("Inclua e edite os usuários autorizados a acessar o sistema.")
 
     st.info(
-        "Para que o orientando acesse o sistema, cadastre o e-mail dele exatamente como ele irá digitar na tela inicial."
+        "Para que o usuário acesse o sistema, cadastre e-mail, senha, perfil e status ativo. "
+        "Use Perfil = Orientador para acesso completo e Perfil = Orientando para acesso individual."
     )
 
     with st.form("form_cadastro"):
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            novo_nome = st.text_input("Discente")
+            novo_nome = st.text_input("Nome / Discente")
             novo_email = st.text_input("E-mail")
+            nova_senha = st.text_input("Senha", type="password")
 
         with col2:
-            novo_programa = st.selectbox("Programa", ["PPGSC", "PPGASFAR", "PRMU", "Farmácia", "Outro"])
+            novo_programa = st.selectbox("Programa", ["PPGSC", "PPGASFAR", "PRMU", "Farmácia", "Orientador", "Outro"])
+            novo_nivel = st.selectbox("Nível", ["Doutorado", "Mestrado", "Residência", "Graduação", "Orientador", "Outro"])
 
         with col3:
-            novo_nivel = st.selectbox("Nível", ["Doutorado", "Mestrado", "Residência", "Graduação", "Outro"])
+            perfil = st.selectbox("Perfil", PERFIS)
             ativo = st.selectbox("Ativo", ["Sim", "Não"])
 
-        cadastrar = st.form_submit_button("Adicionar orientando", type="primary")
+        cadastrar = st.form_submit_button("Adicionar usuário", type="primary")
 
     if cadastrar:
         if not novo_nome.strip():
-            st.warning("Informe o nome do discente.")
+            st.warning("Informe o nome.")
         elif not novo_email.strip():
-            st.warning("Informe o e-mail do discente.")
+            st.warning("Informe o e-mail.")
+        elif not nova_senha.strip():
+            st.warning("Informe uma senha.")
         else:
             novo_cad = pd.DataFrame([
                 {
@@ -696,13 +757,15 @@ elif pagina == "Cadastro de orientandos":
                     "Programa": novo_programa,
                     "Nível": novo_nivel,
                     "Email": novo_email.strip().lower(),
+                    "Senha": nova_senha.strip(),
+                    "Perfil": perfil,
                     "Ativo": ativo
                 }
             ])
 
             df_cadastro = pd.concat([df_cadastro[COLUNAS_CADASTRO], novo_cad], ignore_index=True)
             salvar_cadastro_completo(df_cadastro)
-            st.success("Orientando cadastrado com sucesso.")
+            st.success("Usuário cadastrado com sucesso.")
 
     st.subheader("Base atual")
     editado = st.data_editor(
@@ -754,3 +817,4 @@ elif pagina == "Exportar dados":
         )
 
     st.info("Os dados principais ficam salvos na Planilha Google vinculada ao aplicativo.")
+
