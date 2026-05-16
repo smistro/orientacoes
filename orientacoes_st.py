@@ -8,7 +8,7 @@ from google.oauth2.service_account import Credentials
 # =========================================================
 # SISTEMA COLABORATIVO DE CONTROLE DE ORIENTAÇÕES
 # Streamlit + Google Sheets
-# Versão com autenticação interna por e-mail e senha
+# Versão revisada: autenticação interna + gravação segura em A:M
 # =========================================================
 
 st.set_page_config(
@@ -22,16 +22,12 @@ st.set_page_config(
 # CONFIGURAÇÕES
 # =========================================================
 
-# Nome da planilha Google exatamente como aparece no Google Drive
 NOME_PLANILHA = "controle_orientacoes"
 
-# Nomes das abas obrigatórias na planilha
 ABA_CADASTRO = "cadastro"
 ABA_REGISTROS = "registros"
 ABA_CONFIG = "configuracoes"
 
-# A aba cadastro precisa ter exatamente estas colunas na primeira linha:
-# Discente | Programa | Nível | Email | Senha | Perfil | Ativo
 COLUNAS_CADASTRO = [
     "Discente",
     "Programa",
@@ -47,24 +43,6 @@ COLUNAS_REGISTROS = [
     "Situação", "Pendências", "Responsável", "Prazo",
     "Prioridade", "Observações", "Atualizado_por"
 ]
-
-novo_registro = {
-    "Data": data_hoje,
-    "Hora": hora_agora,
-    "Discente": discente,
-    "Programa": programa,
-    "Nível": nivel,
-    "Email": email,
-    "Situação": situacao,
-    "Pendências": pendencias,
-    "Responsável": responsavel,
-    "Prazo": prazo,
-    "Prioridade": prioridade,
-    "Observações": observacoes,
-    "Atualizado_por": email_usuario
-}
-
-df_novo = pd.DataFrame([novo_registro], columns=COLUNAS_REGISTROS)
 
 PERFIS = ["Orientando", "Orientador"]
 
@@ -131,10 +109,6 @@ st.markdown(
 
 @st.cache_resource
 def conectar_google_sheets():
-    """
-    Conecta ao Google Sheets usando as credenciais salvas no arquivo secrets.toml
-    ou nos Secrets do Streamlit Cloud.
-    """
     try:
         escopos = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -153,7 +127,7 @@ def conectar_google_sheets():
     except Exception as e:
         st.error("Não foi possível conectar ao Google Sheets.")
         st.warning(
-            "Verifique se o arquivo secrets.toml foi configurado corretamente, "
+            "Verifique se o secrets.toml foi configurado corretamente, "
             "se a planilha existe e se foi compartilhada com o e-mail da conta de serviço."
         )
         st.exception(e)
@@ -166,20 +140,87 @@ def obter_aba(planilha, nome_aba, colunas):
         aba = planilha.worksheet(nome_aba)
     except gspread.WorksheetNotFound:
         aba = planilha.add_worksheet(title=nome_aba, rows=1000, cols=max(len(colunas), 10))
-        aba.append_row(colunas)
+        aba.update("A1", [colunas])
     return aba
 
 
-def ler_aba_com_cabecalho_padrao(aba, colunas):
+def normalizar_texto(valor):
+    if pd.isna(valor):
+        return ""
+    return str(valor).strip()
+
+
+def normalizar_email(email):
+    if pd.isna(email):
+        return ""
+    return str(email).strip().lower()
+
+
+def usuario_ativo(valor):
+    return str(valor).strip().lower() in ["sim", "s", "yes", "1", "true"]
+
+
+def ajustar_dataframe_colunas(df, colunas):
+    """Garante que o dataframe tenha exatamente as colunas esperadas, na ordem correta."""
+    df = df.copy()
+    for col in colunas:
+        if col not in df.columns:
+            df[col] = ""
+    return df[colunas].fillna("")
+
+
+def eh_data_valida(valor):
+    if valor in [None, ""]:
+        return False
+    return not pd.isna(pd.to_datetime(valor, errors="coerce"))
+
+
+def limpar_linha_registro(linha):
     """
-    Lê uma aba do Google Sheets usando o cabeçalho definido no código.
-    Isso evita erro do gspread quando há cabeçalhos duplicados, vazios
-    ou diferentes na primeira linha da planilha.
+    Corrige linhas de registros que eventualmente tenham sido gravadas deslocadas.
+    A estrutura correta tem 13 colunas: A:M.
+    Se a linha vier começando em K, W etc., esta função tenta localizar o bloco correto.
+    """
+    linha = [str(x).strip() for x in linha]
+
+    if not any(linha):
+        return None
+
+    texto_unico = linha[0] if len(linha) == 1 else ""
+    if "Data | Hora | Discente" in texto_unico:
+        return None
+
+    # Caso correto: começa na coluna A.
+    bloco = linha[:len(COLUNAS_REGISTROS)]
+    if len(bloco) >= 3 and eh_data_valida(bloco[0]) and bloco[2] != "":
+        return bloco + [""] * (len(COLUNAS_REGISTROS) - len(bloco))
+
+    # Caso deslocado: procura um bloco de 13 colunas começando por uma data.
+    n = len(COLUNAS_REGISTROS)
+    for i in range(0, max(len(linha) - n + 1, 1)):
+        bloco = linha[i:i+n]
+        if len(bloco) < n:
+            bloco = bloco + [""] * (n - len(bloco))
+        if eh_data_valida(bloco[0]) and bloco[2] != "":
+            return bloco
+
+    # Caso raro: linha parcial, mas ainda começa com data.
+    if eh_data_valida(linha[0]):
+        linha = linha[:n]
+        return linha + [""] * (n - len(linha))
+
+    return None
+
+
+def ler_aba_com_cabecalho_padrao(aba, colunas, corrigir_registros=False):
+    """
+    Lê uma aba usando cabeçalho definido no código.
+    Para registros, também corrige linhas deslocadas antes de montar o dataframe.
     """
     valores = aba.get_all_values()
 
     if not valores:
-        aba.update([colunas])
+        aba.update("A1", [colunas])
         return pd.DataFrame(columns=colunas)
 
     primeira_linha = [str(x).strip() for x in valores[0]]
@@ -194,17 +235,49 @@ def ler_aba_com_cabecalho_padrao(aba, colunas):
         return pd.DataFrame(columns=colunas)
 
     dados_ajustados = []
+
     for linha in dados:
-        linha = linha[:len(colunas)]
-        linha = linha + [""] * (len(colunas) - len(linha))
-        dados_ajustados.append(linha)
+        if corrigir_registros:
+            linha_corrigida = limpar_linha_registro(linha)
+            if linha_corrigida is not None:
+                dados_ajustados.append(linha_corrigida)
+        else:
+            linha = linha[:len(colunas)]
+            linha = linha + [""] * (len(colunas) - len(linha))
+            dados_ajustados.append(linha)
+
+    if not dados_ajustados:
+        return pd.DataFrame(columns=colunas)
 
     return pd.DataFrame(dados_ajustados, columns=colunas)
 
 
+def regravar_registros_corrigidos():
+    """
+    Corrige fisicamente a aba registros no Google Sheets.
+    Use pelo botão no app quando houver linhas deslocadas na planilha.
+    """
+    planilha = conectar_google_sheets()
+    aba = obter_aba(planilha, ABA_REGISTROS, COLUNAS_REGISTROS)
+
+    df = ler_aba_com_cabecalho_padrao(
+        aba,
+        COLUNAS_REGISTROS,
+        corrigir_registros=True
+    )
+
+    df = ajustar_dataframe_colunas(df, COLUNAS_REGISTROS)
+
+    for col in df.columns:
+        df[col] = df[col].astype(str).replace("NaT", "")
+
+    aba.clear()
+    aba.update("A1", [COLUNAS_REGISTROS] + df.values.tolist())
+    st.cache_data.clear()
+
+
 @st.cache_data(ttl=20)
 def carregar_dados():
-    """Carrega cadastro, registros e configurações da Planilha Google."""
     planilha = conectar_google_sheets()
 
     aba_cadastro = obter_aba(planilha, ABA_CADASTRO, COLUNAS_CADASTRO)
@@ -212,24 +285,45 @@ def carregar_dados():
     aba_config = obter_aba(planilha, ABA_CONFIG, ["Tipo", "Valor"])
 
     cadastro = ler_aba_com_cabecalho_padrao(aba_cadastro, COLUNAS_CADASTRO)
-    registros = ler_aba_com_cabecalho_padrao(aba_registros, COLUNAS_REGISTROS)
+    registros = ler_aba_com_cabecalho_padrao(
+        aba_registros,
+        COLUNAS_REGISTROS,
+        corrigir_registros=True
+    )
     config = ler_aba_com_cabecalho_padrao(aba_config, ["Tipo", "Valor"])
+
+    cadastro = ajustar_dataframe_colunas(cadastro, COLUNAS_CADASTRO)
+    registros = ajustar_dataframe_colunas(registros, COLUNAS_REGISTROS)
 
     cadastro["Ativo"] = cadastro["Ativo"].replace("", "Sim")
     cadastro["Perfil"] = cadastro["Perfil"].replace("", "Orientando")
+    cadastro["Email"] = cadastro["Email"].apply(normalizar_email)
 
-    if "Data" in registros.columns:
-        registros["Data"] = pd.to_datetime(registros["Data"], errors="coerce").dt.date
-
-    if "Prazo" in registros.columns:
-        registros["Prazo"] = pd.to_datetime(registros["Prazo"], errors="coerce").dt.date
+    registros["Data"] = pd.to_datetime(registros["Data"], errors="coerce").dt.date
+    registros["Prazo"] = pd.to_datetime(registros["Prazo"], errors="coerce").dt.date
 
     situacoes = SITUACOES_PADRAO
     pendencias = PENDENCIAS_PADRAO
 
     if not config.empty and {"Tipo", "Valor"}.issubset(config.columns):
-        sit = config.loc[config["Tipo"] == "Situação", "Valor"].dropna().astype(str).tolist()
-        pen = config.loc[config["Tipo"] == "Pendência", "Valor"].dropna().astype(str).tolist()
+        sit = (
+            config.loc[config["Tipo"] == "Situação", "Valor"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .tolist()
+        )
+        pen = (
+            config.loc[config["Tipo"] == "Pendência", "Valor"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .tolist()
+        )
         if sit:
             situacoes = sit
         if pen:
@@ -239,36 +333,46 @@ def carregar_dados():
 
 
 def salvar_novo_registro(novo_registro):
-    """Adiciona uma nova atualização na aba registros."""
+    """
+    Adiciona uma nova atualização na aba registros.
+    Ponto crítico da revisão: grava SEMPRE na faixa A:M.
+    """
     planilha = conectar_google_sheets()
     aba = obter_aba(planilha, ABA_REGISTROS, COLUNAS_REGISTROS)
 
-    linha = [novo_registro.get(col, "") for col in COLUNAS_REGISTROS]
-    aba.append_row(linha, value_input_option="USER_ENTERED")
+    df_novo = pd.DataFrame([novo_registro])
+    df_novo = ajustar_dataframe_colunas(df_novo, COLUNAS_REGISTROS)
+
+    linha = df_novo.iloc[0].astype(str).replace("NaT", "").tolist()
+
+    # Garante cabeçalho correto em A1:M1.
+    aba.update("A1", [COLUNAS_REGISTROS])
+
+    # table_range restringe o append à tabela A:M, evitando deslocamento para K, W etc.
+    aba.append_row(
+        linha,
+        value_input_option="USER_ENTERED",
+        table_range="A:M"
+    )
+
     st.cache_data.clear()
 
 
 def salvar_cadastro_completo(df_cadastro):
-    """Substitui todo o cadastro na aba cadastro."""
     planilha = conectar_google_sheets()
     aba = obter_aba(planilha, ABA_CADASTRO, COLUNAS_CADASTRO)
 
-    df = df_cadastro.copy()
-    for col in COLUNAS_CADASTRO:
-        if col not in df.columns:
-            df[col] = ""
-
-    df = df[COLUNAS_CADASTRO].fillna("")
+    df = ajustar_dataframe_colunas(df_cadastro, COLUNAS_CADASTRO)
 
     for col in df.columns:
         df[col] = df[col].astype(str)
 
     aba.clear()
-    aba.update([COLUNAS_CADASTRO] + df.values.tolist())
+    aba.update("A1", [COLUNAS_CADASTRO] + df.values.tolist())
     st.cache_data.clear()
 
 # =========================================================
-# FUNÇÕES AUXILIARES
+# FUNÇÕES AUXILIARES DE RESUMO
 # =========================================================
 
 def calcular_status_prazo(prazo):
@@ -294,19 +398,10 @@ def calcular_status_prazo(prazo):
     return "Dentro do prazo"
 
 
-def normalizar_email(email):
-    if pd.isna(email):
-        return ""
-    return str(email).strip().lower()
-
-
-def usuario_ativo(valor):
-    return str(valor).strip().lower() in ["sim", "s", "yes", "1", "true"]
-
-
 def resumo_ultima_situacao(df_registros, df_cadastro):
+    base = df_cadastro.copy()
+
     if df_registros.empty:
-        base = df_cadastro.copy()
         base["Última atualização"] = pd.NaT
         base["Situação"] = "Sem registro"
         base["Pendências"] = ""
@@ -319,16 +414,30 @@ def resumo_ultima_situacao(df_registros, df_cadastro):
 
     df = df_registros.copy()
     df["Data_dt"] = pd.to_datetime(df["Data"], errors="coerce")
+    df["Hora_txt"] = df["Hora"].astype(str).fillna("")
+
+    df = df.dropna(subset=["Data_dt"])
+
+    if df.empty:
+        base["Última atualização"] = pd.NaT
+        base["Situação"] = "Sem registro"
+        base["Pendências"] = ""
+        base["Responsável"] = ""
+        base["Prazo"] = pd.NaT
+        base["Prioridade"] = ""
+        base["Dias sem atualização"] = None
+        base["Status do prazo"] = "Sem prazo"
+        return base
 
     ultimos = (
-        df.sort_values("Data_dt")
+        df.sort_values(["Discente", "Programa", "Nível", "Data_dt", "Hora_txt"])
         .groupby(["Discente", "Programa", "Nível"], as_index=False)
         .tail(1)
     )
 
     ultimos = ultimos.rename(columns={"Data": "Última atualização"})
 
-    base = df_cadastro.merge(
+    base = base.merge(
         ultimos[
             [
                 "Discente",
@@ -358,6 +467,14 @@ def resumo_ultima_situacao(df_registros, df_cadastro):
 
     base = base.drop(columns=["Última atualização_dt"])
     return base
+
+
+def aplicar_filtro_seguro(df, coluna, valores):
+    if df.empty or coluna not in df.columns:
+        return df
+    if not valores:
+        return df.iloc[0:0]
+    return df[df[coluna].isin(valores)].copy()
 
 # =========================================================
 # CARREGAMENTO
@@ -393,24 +510,14 @@ if df_cadastro.empty:
     st.info("Cadastre pelo menos um orientador na aba cadastro da planilha Google.")
     st.stop()
 
-if "Senha" not in df_cadastro.columns:
-    st.title("Controle de Orientações")
-    st.error("A coluna 'Senha' não foi encontrada na aba cadastro.")
-    st.info("A primeira linha da aba cadastro deve ser: Discente | Programa | Nível | Email | Senha | Perfil | Ativo")
-    st.stop()
+for col_obrigatoria in ["Email", "Senha", "Perfil", "Ativo"]:
+    if col_obrigatoria not in df_cadastro.columns:
+        st.title("Controle de Orientações")
+        st.error(f"A coluna '{col_obrigatoria}' não foi encontrada na aba cadastro.")
+        st.info("A primeira linha da aba cadastro deve ser: Discente | Programa | Nível | Email | Senha | Perfil | Ativo")
+        st.stop()
 
-if "Perfil" not in df_cadastro.columns:
-    st.title("Controle de Orientações")
-    st.error("A coluna 'Perfil' não foi encontrada na aba cadastro.")
-    st.info("A primeira linha da aba cadastro deve ser: Discente | Programa | Nível | Email | Senha | Perfil | Ativo")
-    st.stop()
-
-df_cadastro["Email_normalizado"] = (
-    df_cadastro["Email"]
-    .astype(str)
-    .str.strip()
-    .str.lower()
-)
+df_cadastro["Email_normalizado"] = df_cadastro["Email"].apply(normalizar_email)
 
 usuario_logado = df_cadastro[
     (df_cadastro["Email_normalizado"] == email_usuario)
@@ -460,7 +567,8 @@ if acesso_orientador:
         "Nova atualização",
         "Histórico",
         "Cadastro de orientandos",
-        "Exportar dados"
+        "Exportar dados",
+        "Manutenção"
     ]
 else:
     paginas = [
@@ -474,16 +582,17 @@ pagina = st.sidebar.radio("Menu", paginas)
 st.sidebar.divider()
 st.sidebar.caption("Filtros")
 
-programas = sorted(df_resumo["Programa"].dropna().unique())
-niveis = sorted(df_resumo["Nível"].dropna().unique())
+programas = sorted(df_resumo["Programa"].dropna().astype(str).unique()) if "Programa" in df_resumo.columns else []
+niveis = sorted(df_resumo["Nível"].dropna().astype(str).unique()) if "Nível" in df_resumo.columns else []
 
 filtro_programa = st.sidebar.multiselect("Programa", programas, default=programas)
 filtro_nivel = st.sidebar.multiselect("Nível", niveis, default=niveis)
 
-resumo_filtrado = df_resumo[
-    df_resumo["Programa"].isin(filtro_programa) &
-    df_resumo["Nível"].isin(filtro_nivel)
-].copy()
+resumo_filtrado = df_resumo.copy()
+if programas:
+    resumo_filtrado = aplicar_filtro_seguro(resumo_filtrado, "Programa", filtro_programa)
+if niveis:
+    resumo_filtrado = aplicar_filtro_seguro(resumo_filtrado, "Nível", filtro_nivel)
 
 # =========================================================
 # PAINEL GERAL DO ORIENTADOR
@@ -530,10 +639,13 @@ if pagina == "Painel geral":
             st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Situação")
-        contagem_situacao = resumo_filtrado["Situação"].value_counts().reset_index()
-        contagem_situacao.columns = ["Situação", "Total"]
-        fig2 = px.bar(contagem_situacao, x="Total", y="Situação", orientation="h")
-        st.plotly_chart(fig2, use_container_width=True)
+        if not resumo_filtrado.empty:
+            contagem_situacao = resumo_filtrado["Situação"].value_counts().reset_index()
+            contagem_situacao.columns = ["Situação", "Total"]
+            fig2 = px.bar(contagem_situacao, x="Total", y="Situação", orientation="h")
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("Sem dados para exibir.")
 
     st.divider()
     st.subheader("Alertas")
@@ -611,6 +723,8 @@ elif pagina == "Nova atualização":
     else:
         orientandos_ativos = usuario_logado.copy()
 
+    orientandos_ativos = ajustar_dataframe_colunas(orientandos_ativos, COLUNAS_CADASTRO)
+
     orientandos_ativos["Nome completo"] = (
         orientandos_ativos["Discente"].astype(str)
         + " — "
@@ -666,6 +780,7 @@ elif pagina == "Nova atualização":
 
         salvar_novo_registro(novo)
         st.success("Atualização salva com sucesso.")
+        st.rerun()
 
 # =========================================================
 # HISTÓRICO
@@ -678,15 +793,14 @@ elif pagina in ["Histórico", "Meu histórico"]:
         st.info("Ainda não há registros de orientação.")
     else:
         df_hist = df_registros.copy()
-        df_hist = df_hist[
-            df_hist["Programa"].isin(filtro_programa) &
-            df_hist["Nível"].isin(filtro_nivel)
-        ]
+        df_hist = aplicar_filtro_seguro(df_hist, "Programa", filtro_programa)
+        df_hist = aplicar_filtro_seguro(df_hist, "Nível", filtro_nivel)
 
         if acesso_orientador:
-            nomes = sorted(df_hist["Discente"].dropna().unique())
+            nomes = sorted(df_hist["Discente"].dropna().astype(str).unique())
             nome_filtro = st.multiselect("Filtrar por discente", nomes, default=nomes)
-            situacao_filtro = st.multiselect("Filtrar por situação", sorted(df_hist["Situação"].dropna().unique()))
+            situacoes_hist = sorted(df_hist["Situação"].dropna().astype(str).unique())
+            situacao_filtro = st.multiselect("Filtrar por situação", situacoes_hist)
 
             df_hist = df_hist[df_hist["Discente"].isin(nome_filtro)]
             if situacao_filtro:
@@ -698,7 +812,7 @@ elif pagina in ["Histórico", "Meu histórico"]:
         st.subheader("Linha do tempo")
 
         if acesso_orientador:
-            nomes_timeline = sorted(df_hist["Discente"].dropna().unique())
+            nomes_timeline = sorted(df_hist["Discente"].dropna().astype(str).unique())
             if nomes_timeline:
                 discente_timeline = st.selectbox("Selecionar discente", nomes_timeline)
                 linha_tempo = df_hist[df_hist["Discente"] == discente_timeline].sort_values(["Data", "Hora"], ascending=False)
@@ -771,9 +885,10 @@ elif pagina == "Cadastro de orientandos":
                 }
             ])
 
-            df_cadastro = pd.concat([df_cadastro[COLUNAS_CADASTRO], novo_cad], ignore_index=True)
-            salvar_cadastro_completo(df_cadastro)
+            df_salvar = pd.concat([df_cadastro[COLUNAS_CADASTRO], novo_cad], ignore_index=True)
+            salvar_cadastro_completo(df_salvar)
             st.success("Usuário cadastrado com sucesso.")
+            st.rerun()
 
     st.subheader("Base atual")
     editado = st.data_editor(
@@ -786,6 +901,7 @@ elif pagina == "Cadastro de orientandos":
     if st.button("Salvar alterações no cadastro"):
         salvar_cadastro_completo(editado)
         st.success("Cadastro atualizado.")
+        st.rerun()
 
 # =========================================================
 # EXPORTAÇÃO
@@ -826,3 +942,21 @@ elif pagina == "Exportar dados":
 
     st.info("Os dados principais ficam salvos na Planilha Google vinculada ao aplicativo.")
 
+# =========================================================
+# MANUTENÇÃO
+# =========================================================
+
+elif pagina == "Manutenção":
+    st.title("Manutenção da planilha")
+    st.warning(
+        "Use esta área apenas quando houver registros deslocados ou inconsistentes na aba registros. "
+        "A rotina regrava a aba registros somente com as colunas oficiais A:M."
+    )
+
+    st.subheader("Prévia dos registros lidos pelo app")
+    st.dataframe(df_registros, use_container_width=True, hide_index=True, height=400)
+
+    if st.button("Corrigir fisicamente a aba registros", type="primary"):
+        regravar_registros_corrigidos()
+        st.success("A aba registros foi regravada com as colunas corretas em A:M.")
+        st.rerun()
