@@ -43,20 +43,28 @@ COLUNAS_CADASTRO = [
 ]
 
 COLUNAS_REGISTROS = [
-    "Data",
-    "Hora",
-    "Discente",
-    "Programa",
-    "Nível",
-    "Email",
-    "Situação",
-    "Pendências",
-    "Responsável",
-    "Prazo",
-    "Prioridade",
-    "Observações",
-    "Atualizado_por"
+    "Data", "Hora", "Discente", "Programa", "Nível", "Email",
+    "Situação", "Pendências", "Responsável", "Prazo",
+    "Prioridade", "Observações", "Atualizado_por"
 ]
+
+novo_registro = {
+    "Data": data_hoje,
+    "Hora": hora_agora,
+    "Discente": discente,
+    "Programa": programa,
+    "Nível": nivel,
+    "Email": email,
+    "Situação": situacao,
+    "Pendências": pendencias,
+    "Responsável": responsavel,
+    "Prazo": prazo,
+    "Prioridade": prioridade,
+    "Observações": observacoes,
+    "Atualizado_por": email_usuario
+}
+
+df_novo = pd.DataFrame([novo_registro], columns=COLUNAS_REGISTROS)
 
 PERFIS = ["Orientando", "Orientador"]
 
